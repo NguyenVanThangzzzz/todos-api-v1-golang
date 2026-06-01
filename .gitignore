@@ -1,0 +1,43 @@
+# ===== Binaries =====
+# Output của `go build -o todo-api ./cmd/api`
+/todo-api
+/todo-api.exe
+# Binary tổng quát
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+
+# ===== Test & coverage =====
+*.test
+*.out
+coverage.out
+coverage.html
+
+# ===== Environment & secrets =====
+# .env chứa DB_PASSWORD, JWT_SECRET... -> KHÔNG commit
+# Vẫn commit .env.example (đã loại trừ bên dưới)
+.env
+.env.local
+.env.*.local
+*.local
+!.env.example
+
+# ===== Vendor (đang dùng Go Modules, không vendoring) =====
+/vendor/
+
+# ===== Logs =====
+*.log
+
+# ===== IDE / Editor =====
+.idea/
+.vscode/
+*.swp
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db

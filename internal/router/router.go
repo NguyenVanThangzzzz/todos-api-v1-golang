@@ -2,14 +2,14 @@ package router
 
 import (
 	"github.com/gin-gonic/gin"
-	"github.com/thangnguyen/todo_api_v1/internal/handler"
 	"github.com/thangnguyen/todo_api_v1/internal/middleware"
+	"github.com/thangnguyen/todo_api_v1/internal/modules/auth"
+	"github.com/thangnguyen/todo_api_v1/internal/modules/todo"
+	"github.com/thangnguyen/todo_api_v1/pkg/jwt"
 	"github.com/thangnguyen/todo_api_v1/pkg/logger"
 )
 
-// New khởi tạo Gin engine và đăng ký routes.
-// Tách hàm này khỏi main.go giúp test dễ hơn (có thể spin lên 1 engine trong test).
-func New(todoH *handler.TodoHandler, log *logger.Logger) *gin.Engine {
+func New(todoH *todo.Handler, authH *auth.Handler, jwtManager *jwt.Manager, log *logger.Logger) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 
@@ -21,15 +21,8 @@ func New(todoH *handler.TodoHandler, log *logger.Logger) *gin.Engine {
 	})
 
 	v1 := r.Group("/api/v1")
-	{
-		todos := v1.Group("/todos")
-		{
-			todos.POST("", todoH.Create)
-			todos.GET("", todoH.List)
-			todos.GET(":id", todoH.GetByID)
-			todos.PATCH(":id", todoH.Update)
-			todos.DELETE(":id", todoH.Delete)
-		}
-	}
+	auth.RegisterRoutes(v1, authH)
+	todo.RegisterRoutes(v1, todoH, jwtManager)
+
 	return r
 }

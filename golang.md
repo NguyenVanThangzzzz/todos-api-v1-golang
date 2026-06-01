@@ -2,6 +2,8 @@
 
 Tài liệu này giải thích **công nghệ**, **cấu trúc Clean Architecture**, và **flow chạy code** của project. Mọi khái niệm đều có đối chiếu sang Node.js để bạn dễ hình dung.
 
+> **Cập nhật:** project đã chuyển từ lưu trữ in-memory (`map`) sang **PostgreSQL** thông qua ORM **GORM**. Các phần liên quan đến storage bên dưới đã được cập nhật theo.
+
 ---
 
 ## 1. Công nghệ sử dụng
@@ -12,13 +14,16 @@ Tài liệu này giải thích **công nghệ**, **cấu trúc Clean Architectur
 | Validation | [`go-playground/validator`](https://github.com/go-playground/validator) | **Zod**, Joi, class-validator |
 | Logger | [`uber-go/zap`](https://github.com/uber-go/zap) | Pino, Winston |
 | UUID | [`google/uuid`](https://github.com/google/uuid) | `uuid` package |
-| Storage | `map[string]*Todo` + `sync.RWMutex` | `Map` của JS (nhưng JS single-thread, Go cần mutex) |
+| **ORM** | [`gorm.io/gorm`](https://gorm.io) | **Prisma**, TypeORM, Sequelize |
+| **Postgres driver** | [`gorm.io/driver/postgres`](https://github.com/go-gorm/postgres) (pgx) | `pg` / `postgres` |
+| **Database** | **PostgreSQL** (`todo_api_golang`) | PostgreSQL / MySQL |
 
 ### Vì sao chọn các thư viện này?
 
 - **Gin**: nhanh nhất trong các framework Go phổ biến, API đơn giản giống Express, được dùng rộng rãi trong industry.
 - **go-playground/validator**: chuẩn de-facto của hệ sinh thái Go. Khai báo validate ngay trên struct bằng tag — tương đương `z.object({...})` của Zod, nhưng nằm cạnh field thay vì file schema riêng.
 - **Zap**: structured logger nhanh nhất Go, xuất JSON chuẩn để stream vào ELK/Loki/Datadog.
+- **GORM**: ORM phổ biến nhất của Go. Map struct ↔ bảng bằng tag `gorm:"..."`, có `AutoMigrate`, query builder, hooks — tương tự Prisma/TypeORM bên Node.
 
 ---
 
@@ -26,16 +31,14 @@ Tài liệu này giải thích **công nghệ**, **cấu trúc Clean Architectur
 
 ```
 todo_api_v1/
-├── cmd/
-│   └── api/
-│       └── main.go              # Entry point — wire dependencies, start server
-├── internal/                    # Code "nội bộ" — Go cấm package ngoài import vào đây
+├── main.go                       # Entry point — kết nối DB, wire dependencies, start server
+├── internal/                     # Code "nội bộ" — Go cấm package ngoài import vào đây
 │   ├── domain/
-│   │   └── todo.go              # Entity (model thuần, không phụ thuộc gì)
+│   │   └── todo.go              # Entity (model) + tag gorm map xuống cột Postgres
 │   ├── dto/
 │   │   └── todo_dto.go          # Request/Response shape + rule validate
 │   ├── repository/
-│   │   └── todo_repository.go   # Lớp lưu trữ (in-memory map)
+│   │   └── todo_repository.go   # Lớp lưu trữ — PostgreSQL qua GORM
 │   ├── usecase/
 │   │   └── todo_usecase.go      # Business logic
 │   ├── handler/
@@ -44,11 +47,13 @@ todo_api_v1/
 │   │   └── logger.go            # Request logging + panic recovery
 │   └── router/
 │       └── router.go            # Đăng ký endpoints
-├── pkg/                         # Code có thể tái sử dụng cho project khác
+├── pkg/                          # Code có thể tái sử dụng cho project khác
+│   ├── database/
+│   │   └── postgres.go          # Mở kết nối GORM tới PostgreSQL (đọc DSN từ env)
 │   ├── logger/
 │   ├── validator/
 │   └── response/
-├── go.mod                       # Như package.json
+├── go.mod                        # Như package.json
 └── golang.md
 ```
 
@@ -56,12 +61,12 @@ todo_api_v1/
 
 ```
 handler  →  usecase  →  repository  →  domain
-   ↑           ↑             ↑
-   └── dto     └── dto       (chỉ phụ thuộc domain)
+   ↑           ↑             ↑              ↑
+   └── dto     └── dto       └── gorm.DB    (entity thuần)
 ```
 
 - **Lớp trong không biết lớp ngoài.** `domain` không biết `usecase`; `usecase` không biết `handler`.
-- `usecase` phụ thuộc **interface** `TodoRepository`, không phụ thuộc implementation. → Đổi sang Postgres/Mongo chỉ cần viết struct mới implement interface, không sửa usecase.
+- `usecase` phụ thuộc **interface** `TodoRepository`, không phụ thuộc implementation. → Đây chính là lý do việc đổi từ in-memory sang Postgres chỉ cần viết struct `postgresRepo` mới implement interface, **không sửa usecase/handler**.
 
 ---
 
@@ -82,6 +87,8 @@ handler  →  usecase  →  repository  →  domain
 | Constructor | Hàm `New<Type>(...)` trả về `*Type` (convention) |
 | `JSON.stringify` | Tag `json:"field_name"` + `encoding/json` (Gin tự lo) |
 | Zod schema | Tag `validate:"required,min=1"` ngay trên field struct |
+| Prisma `@id`, `@default` trong schema | Tag `gorm:"primaryKey;default:..."` ngay trên field struct |
+| `prisma migrate` | `db.AutoMigrate(&Todo{})` chạy lúc khởi động |
 
 ### Pointer (`*`) - khái niệm mới cần nắm
 
@@ -96,7 +103,67 @@ func (u *TodoUsecase) Create(...)   // (u *TodoUsecase) = "u" là con trỏ tớ
 
 ---
 
-## 4. Flow chạy một request
+## 4. Kết nối Database (GORM + PostgreSQL)
+
+### Entity map xuống bảng (`internal/domain/todo.go`)
+
+```go
+type Todo struct {
+    ID          string    `gorm:"type:uuid;primaryKey" json:"id"`
+    Title       string    `gorm:"type:varchar(200);not null" json:"title"`
+    Description string    `gorm:"type:varchar(1000)" json:"description"`
+    Completed   bool      `gorm:"not null;default:false" json:"completed"`
+    CreatedAt   time.Time `json:"created_at"`   // GORM tự fill khi Create
+    UpdatedAt   time.Time `json:"updated_at"`   // GORM tự cập nhật khi Save
+}
+
+func (Todo) TableName() string { return "todos" }
+```
+
+- `CreatedAt` / `UpdatedAt` là tên field "thần kỳ" của GORM: nó tự động set khi tạo / cập nhật (giống `@default(now())` / `@updatedAt` của Prisma).
+
+### Mở kết nối (`pkg/database/postgres.go`)
+
+DSN (chuỗi kết nối) được build từ **biến môi trường**, có sẵn giá trị mặc định để chạy local ngay:
+
+| Biến env | Mặc định |
+|---|---|
+| `DB_HOST` | `localhost` |
+| `DB_PORT` | `5432` |
+| `DB_USER` | `postgres` |
+| `DB_PASSWORD` | `123123` |
+| `DB_NAME` | `todo_api_golang` |
+| `DB_SSLMODE` | `disable` |
+
+```go
+db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+    Logger: gormlogger.Default.LogMode(gormlogger.Warn),
+})
+```
+
+### Repository dùng GORM (`internal/repository/todo_repository.go`)
+
+```go
+func NewPostgresTodoRepository(db *gorm.DB) TodoRepository { return &postgresRepo{db: db} }
+
+func (r *postgresRepo) Create(t *domain.Todo) error { return r.db.Create(t).Error }
+
+func (r *postgresRepo) GetByID(id string) (*domain.Todo, error) {
+    var t domain.Todo
+    if err := r.db.First(&t, "id = ?", id).Error; err != nil {
+        if errors.Is(err, gorm.ErrRecordNotFound) { return nil, ErrNotFound }
+        return nil, err
+    }
+    return &t, nil
+}
+// Update dùng Save (ghi đè cả Completed=false); Delete + RowsAffected==0 → ErrNotFound
+```
+
+> **Lưu ý quan trọng:** vì query DB có thể lỗi, interface đã đổi `List()` từ `[]*domain.Todo` thành `List() ([]*domain.Todo, error)`. Usecase và handler đã được cập nhật để xử lý error này.
+
+---
+
+## 5. Flow chạy một request
 
 Giả sử client gửi `POST /api/v1/todos` với body `{"title":"buy milk"}`:
 
@@ -129,10 +196,10 @@ Giả sử client gửi `POST /api/v1/todos` với body `{"title":"buy milk"}`:
      │
      ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 4. inMemoryRepo.Create (repository/todo_repository.go)      │
-│    - Lock mutex (chặn goroutine khác)                       │
-│    - r.store[t.ID] = t                                      │
-│    - Unlock                                                 │
+│ 4. postgresRepo.Create (repository/todo_repository.go)      │
+│    - r.db.Create(t)  → GORM sinh câu lệnh:                  │
+│      INSERT INTO "todos" (...) VALUES (...)                  │
+│    - Trả về .Error (nil nếu thành công)                     │
 └────┬────────────────────────────────────────────────────────┘
      │  trả về (*Todo, nil)
      ▼
@@ -158,19 +225,23 @@ Giả sử client gửi `POST /api/v1/todos` với body `{"title":"buy milk"}`:
 
 ```go
 1. logger.New()                          // tạo logger
-2. repository.NewInMemoryTodoRepository  // ┐
-3. usecase.NewTodoUsecase(repo)          // │ Dependency Injection thủ công
-4. validator.New()                       // │ (không có decorator như Nest)
-5. handler.NewTodoHandler(uc, v, log)    // ┘
-6. router.New(handler, log)              // gắn route + middleware
-7. srv.ListenAndServe() trong goroutine  // server chạy non-blocking
-8. signal.Notify(quit, SIGINT, SIGTERM)  // chờ Ctrl+C
-9. srv.Shutdown(ctx)                     // graceful shutdown (drain connections)
+2. database.New()                        // ┐ mở kết nối GORM tới PostgreSQL
+3. db.AutoMigrate(&domain.Todo{})        // ┘ tự tạo/cập nhật bảng "todos"
+4. repository.NewPostgresTodoRepository  // ┐
+5. usecase.NewTodoUsecase(repo)          // │ Dependency Injection thủ công
+6. validator.New()                       // │ (không có decorator như Nest)
+7. handler.NewTodoHandler(uc, v, log)    // ┘
+8. router.New(handler, log)              // gắn route + middleware
+9. srv.ListenAndServe() trong goroutine  // server chạy non-blocking
+10. signal.Notify(quit, SIGINT, SIGTERM) // chờ Ctrl+C
+11. srv.Shutdown(ctx)                     // graceful shutdown (drain connections)
 ```
+
+> `AutoMigrate` **không cần** chạy lệnh migration riêng — mỗi lần khởi động nó tự tạo bảng nếu chưa có và thêm cột mới nếu bạn thêm field. Nó không xóa cột / không đổi kiểu cột đã tồn tại (tránh mất dữ liệu).
 
 ---
 
-## 5. API Endpoints
+## 6. API Endpoints
 
 | Method | Path | Body | Mô tả |
 |---|---|---|---|
@@ -190,61 +261,79 @@ Giả sử client gửi `POST /api/v1/todos` với body `{"title":"buy milk"}`:
 
 ---
 
-## 6. Cách chạy
+## 7. Cách chạy
+
+### Yêu cầu trước
+
+1. PostgreSQL đang chạy (mặc định `localhost:5432`).
+2. Đã tạo database tên `todo_api_golang` (tạo bằng pgAdmin hoặc `CREATE DATABASE todo_api_golang;`).
+3. Thông tin user/password khớp với biến env ở mục 4 (mặc định `postgres` / `123123`).
+
+> Bảng `todos` **không cần tạo tay** — `AutoMigrate` sẽ tự tạo khi chạy app lần đầu.
 
 ```bash
 # Tải dependencies (đọc go.mod, ghi go.sum)
 go mod tidy
 
-# Chạy app
-go run ./cmd/api
+# Chạy app (entry point ở thư mục gốc)
+go run .
 
 # Build binary (1 file, không cần Node runtime)
-go build -o todo-api ./cmd/api
+go build -o todo-api .
 ./todo-api
 
-# Đổi port (mặc định 8080)
-PORT=3000 go run ./cmd/api
+# Đổi port (mặc định 3636)
+PORT=3000 go run .
+```
+
+### Tuỳ chỉnh kết nối DB bằng env (ví dụ PowerShell)
+
+```powershell
+$env:DB_PASSWORD = "your_password"
+$env:DB_NAME     = "todo_api_golang"
+go run .
 ```
 
 ### Test nhanh bằng curl
 
 ```bash
 # Create
-curl -X POST localhost:8080/api/v1/todos \
+curl -X POST localhost:3636/api/v1/todos \
   -H "Content-Type: application/json" \
   -d '{"title":"buy milk","description":"2L oat milk"}'
 
 # List
-curl localhost:8080/api/v1/todos
+curl localhost:3636/api/v1/todos
 
 # Update
-curl -X PATCH localhost:8080/api/v1/todos/<id> \
+curl -X PATCH localhost:3636/api/v1/todos/<id> \
   -H "Content-Type: application/json" \
   -d '{"completed":true}'
 
 # Delete
-curl -X DELETE localhost:8080/api/v1/todos/<id>
+curl -X DELETE localhost:3636/api/v1/todos/<id>
 ```
 
 ---
 
-## 7. Những điểm dễ vấp khi mới chuyển từ Node
+## 8. Những điểm dễ vấp khi mới chuyển từ Node
 
 1. **Public/Private dựa vào chữ hoa**: `func foo()` chỉ dùng trong package; `func Foo()` mới export ra ngoài. Đây là lý do tất cả constructor đặt là `New<Type>` (viết hoa).
 2. **Không có `null`, có `nil`** — và `nil` chỉ dùng được với pointer, slice, map, channel, function, interface.
-3. **Concurrent by default**: mỗi request là 1 goroutine. Nếu chia sẻ state (như map của repo) **phải** dùng mutex/channel. Node không cần vì event loop single-thread.
-4. **Error là giá trị, không phải exception**: hàm trả `(result, error)`, bạn phải check `if err != nil` ngay. Không có `try/catch` (chỉ có `panic/recover` cho lỗi không-thể-cứu).
-5. **Không có `undefined`**: field không khai báo trong JSON sẽ về zero-value (`""`, `0`, `false`). Đó là lý do PATCH dùng pointer (`*string`) để biết client có truyền hay không.
-6. **`go.mod` tracking exact**: thêm import mới chạy `go mod tidy` để tải về (giống `npm install` nhưng tự động dựa trên code).
-7. **Interface implicit**: bạn không khai báo `class X implements Y`. Chỉ cần struct có đủ method, Go tự nhận là implement interface đó. → Tách layer cực dễ.
+3. **Error là giá trị, không phải exception**: hàm trả `(result, error)`, bạn phải check `if err != nil` ngay. Không có `try/catch` (chỉ có `panic/recover` cho lỗi không-thể-cứu).
+4. **Không có `undefined`**: field không khai báo trong JSON sẽ về zero-value (`""`, `0`, `false`). Đó là lý do PATCH dùng pointer (`*string`) để biết client có truyền hay không. Khi update, dùng `db.Save` (ghi đè cả cột) thay vì `db.Updates` (bỏ qua zero-value) để `completed=false` vẫn được lưu.
+5. **`go.mod` tracking exact**: thêm import mới chạy `go mod tidy` để tải về (giống `npm install` nhưng tự động dựa trên code).
+6. **Interface implicit**: bạn không khai báo `class X implements Y`. Chỉ cần struct có đủ method, Go tự nhận là implement interface đó. → Tách layer cực dễ (đây là cách `postgresRepo` thay thế `inMemoryRepo` mà không sửa usecase).
+7. **GORM `ErrRecordNotFound`**: khi `First` không tìm thấy bản ghi, GORM trả lỗi `gorm.ErrRecordNotFound`. Repository bắt lỗi này và map sang `ErrNotFound` riêng của domain để usecase/handler trả về HTTP 404.
 
 ---
 
-## 8. Hướng mở rộng
+## 9. Hướng mở rộng
 
-- **Thay in-memory bằng Postgres**: viết `postgresRepo struct {}` implement `TodoRepository`, đổi `NewInMemoryTodoRepository` → `NewPostgresTodoRepository(db)` trong `main.go`. Không sửa usecase/handler.
+- **Connection pooling / timeout**: lấy `sqlDB, _ := db.DB()` rồi set `SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`.
+- **Soft delete**: thêm field `gorm.DeletedAt` vào entity → GORM tự chuyển `DELETE` thành `UPDATE deleted_at = now()`.
+- **Migration chuyên nghiệp**: thay `AutoMigrate` bằng [`golang-migrate`](https://github.com/golang-migrate/migrate) hoặc `goose` để versioning migration trong production.
 - **Thêm auth**: viết middleware kiểm JWT, đặt trước route cần bảo vệ (`v1.Use(authMiddleware)`).
-- **Config từ env**: dùng `github.com/spf13/viper` hoặc `github.com/caarlos0/env`.
-- **Test**: Go có sẵn `testing` package — đặt file `*_test.go` cạnh code, chạy `go test ./...`. Mock repository dễ vì usecase phụ thuộc interface.
+- **Config từ env**: gom các biến `DB_*`, `PORT` vào struct config dùng `github.com/spf13/viper` hoặc `github.com/caarlos0/env` thay vì đọc lẻ `os.Getenv`.
+- **Test**: Go có sẵn `testing` package — đặt file `*_test.go` cạnh code, chạy `go test ./...`. Mock repository dễ vì usecase phụ thuộc interface (không cần DB thật khi test usecase).
 - **Production logger**: đổi `zap.NewDevelopmentConfig()` thành `zap.NewProductionConfig()` để xuất JSON gọn nhẹ.

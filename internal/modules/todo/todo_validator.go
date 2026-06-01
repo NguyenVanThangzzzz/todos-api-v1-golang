@@ -1,4 +1,4 @@
-package validator
+package todo
 
 import (
 	"fmt"
@@ -7,30 +7,17 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-// Validator wrap thư viện go-playground/validator
-// Tương đương việc bạn dùng zod.object({...}).parse() bên Node.js
-type Validator struct {
-	v *validator.Validate
-}
+var validate = validator.New()
 
-func New() *Validator {
-	return &Validator{v: validator.New()}
-}
-
-// Struct validate một struct bất kỳ dựa vào tag `validate:"..."`
-// Trả về error đã được format dễ đọc, ví dụ:
-//   "title is required; description must be at most 1000 characters"
-func (vd *Validator) Struct(s any) error {
-	err := vd.v.Struct(s)
+func validateStruct(s any) error {
+	err := validate.Struct(s)
 	if err == nil {
 		return nil
 	}
-
 	validationErrs, ok := err.(validator.ValidationErrors)
 	if !ok {
 		return err
 	}
-
 	msgs := make([]string, 0, len(validationErrs))
 	for _, fe := range validationErrs {
 		msgs = append(msgs, formatFieldError(fe))
